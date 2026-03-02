@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <!-- Disable lint checks that are too strict for this project -->
+    <issue id="OldTargetApi" severity="warning" />
+    <issue id="GradleDeprecated" severity="warning" />
+    <issue id="Deprecated" severity="warning" />
+    <issue id="MissingPermission" severity="warning" />
+    <issue id="NewApi" severity="warning" />
+    <issue id="Range" severity="warning" />
+    <issue id="SetTextI18n" severity="ignore" />
+    <issue id="HardcodedText" severity="ignore" />
+    <issue id="ContentDescription" severity="ignore" />
+    <issue id="MissingTranslation" severity="ignore" />
+    <issue id="ExtraTranslation" severity="ignore" />
+    <issue id="UnusedAttribute" severity="warning" />
+    <issue id="ExportedReceiver" severity="warning" />
+    <issue id="ExportedService" severity="warning" />
+</lint>
